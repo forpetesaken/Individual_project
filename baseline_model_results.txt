@@ -1,0 +1,54 @@
+Dataset: 45132 samples, 6 features
+Class distribution: [44893    43   196]
+Train set: 35903 samples
+Validation set: 9229 samples
+Training on 35903 samples, validating on 9229 samples
+Using device: cuda
+
+=== Training CNN ===
+
+=== Training logistic_regression ===
+✓ logistic_regression trained successfully in 0.56s
+
+=== Training rule_based ===
+✓ rule_based trained successfully in 0.04s
+
+=== CNN RESULTS ===
+AP Compression: 0.532
+AP Regular: 0.445
+Accuracy: 0.983
+Training time: 49.14s
+Comp - Sens: 1.000, FA/day: 0.500
+Reg - Sens: 0.952, FA/day: 1.000
+
+=== LOGISTIC_REGRESSION RESULTS ===
+AP Compression: 0.158
+AP Regular: 0.110
+Accuracy: 0.980
+Training time: 0.56s
+Comp - Sens: 0.800, FA/day: 0.478
+Reg - Sens: 0.333, FA/day: 0.993
+
+=== RULE_BASED RESULTS ===
+AP Compression: 0.001
+AP Regular: 0.006
+Accuracy: 0.995
+Training time: 0.04s
+Comp - Sens: 0.000, FA/day: 0.000
+Reg - Sens: 0.000, FA/day: 0.000
+Plots saved to comparison_results
+
+================================================================================
+MODEL COMPARISON SUMMARY
+================================================================================
+Model                AP Avg   AP Comp  AP Reg   Accuracy Time(s) 
+--------------------------------------------------------------------------------
+cnn                  0.488    0.532    0.445    0.983    49.1    
+logistic_regression  0.134    0.158    0.110    0.980    0.6     
+rule_based           0.003    0.001    0.006    0.995    0.0     
+
+Detailed results saved to: comparison_results
+Model bundle saved to: comparison_results/model_comparison_bundle.joblib
+
+Job completed at: Tue Oct 14 00:48:41 CDT 2025
+Exit status: 0
