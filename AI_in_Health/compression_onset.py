@@ -1,9 +1,3 @@
-"""
-compression_onset.py
---------------------
-End-to-end training & thresholding for a 3-class onset detector:
-0 = none, 1 = compression-onset window, 2 = regular-onset window
-"""
 
 import argparse, joblib, numpy as np, pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -14,18 +8,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 
-# -----------------------
-# Feature engineering
-# -----------------------
 def make_features(glucose: np.ndarray,
                   win_var: int = 15,
                   d_short: int = 5,
                   d_pct: int = 10) -> np.ndarray:
-    """
-    Create glucose-only features for each time index.
-
-    Parameters are in samples (assume 1-sample = 1 minute).
-    """
+  
     n = len(glucose)
     feats = np.zeros((n, 6), dtype=float)
     for i in range(n):
@@ -39,16 +26,7 @@ def make_features(glucose: np.ndarray,
         feats[i] = [g_t, d1, d5, accel, var15, pct10]
     return feats
 
-# -----------------------
-# Threshold picker
-# -----------------------
 def pick_threshold(y_true_bin, p_class, timestamps, max_false_per_day=0.5):
-    """
-    Scan thresholds 0..1 to find the highest sensitivity s.t. FA/day <= target.
-    y_true_bin: 1 for this class, 0 otherwise
-    p_class: probabilities for this class
-    timestamps: pd.Series of datetimes (sorted)
-    """
     days = (timestamps.iloc[-1].normalize() - timestamps.iloc[0].normalize()).days + 1
     best = None
     for T in np.linspace(0, 1, 501):
@@ -70,14 +48,7 @@ def pick_threshold(y_true_bin, p_class, timestamps, max_false_per_day=0.5):
                 best = {"T": T, "sens": sens, "fa_per_day": fa_per_day}
     return best
 
-# -----------------------
-# Streaming helper
-# -----------------------
 class StreamingDetector:
-    """
-    Minimal runtime detector: keep last N glucose points, compute one feature row,
-    get probs, apply thresholds.
-    """
     def __init__(self, scaler, model, T_comp, T_reg,
                  win_var=15, d_short=5, d_pct=10,
                  refractory_minutes_comp=30, refractory_minutes_reg=15,
@@ -144,23 +115,18 @@ class TinyCNN(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv1d(n_feat, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.gap   = nn.AdaptiveAvgPool1d(1)          # global avg‑pool
+        self.gap   = nn.AdaptiveAvgPool1d(1) # global avg‑pool
         self.fc    = nn.Linear(64, n_classes)
 
-    def forward(self, x):             # x: [B, n_feat, T]  (T=1 here)
+    def forward(self, x):  # x: [B, n_feat, T]  (T=1 here)
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
-        x = self.gap(x).squeeze(-1)   # [B, 64]
-        return self.fc(x)             # logits
-
-
-# -----------------------
-# Main script
-# -----------------------
+        x = self.gap(x).squeeze(-1) # [B, 64]
+        return self.fc(x) # logits
 def main(args):
     df = pd.read_csv(args.csv)
 
-    # handle High / Low strings (case-insensitive)
+    # HIGH and LOW strings
     df["glucose"] = (
         df["glucose"]
           .astype(str)
@@ -178,14 +144,11 @@ def main(args):
     glucose = df["glucose"].to_numpy(dtype=float)
     y = df["label"].astype(int).to_numpy()
 
-    # Build features
+    # Building features
     X = make_features(glucose,
                       win_var=args.win_var,
                       d_short=args.delta_short,
                       d_pct=args.delta_pct)
-
-    # --- GroupKFold cross-validation ---
-    # --- GroupKFold cross-validation ---
     groups = df["day_id"] if "day_id" in df.columns else None
     if groups is not None:
         ap_comp_list, ap_reg_list = [], []
@@ -208,7 +171,7 @@ def main(args):
             X_train = scaler.fit_transform(X_train)
             X_val   = scaler.transform(X_val)
 
-            # --- CNN: reshape & tensors ---
+            # reshaping
             X_train_torch = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)
             y_train_torch = torch.tensor(y_train, dtype=torch.long)
             X_val_torch   = torch.tensor(X_val,   dtype=torch.float32).unsqueeze(-1)
@@ -219,14 +182,14 @@ def main(args):
             train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
             val_loader   = DataLoader(val_ds,   batch_size=256)
 
-            # --- Model ---
+            # tinycnn
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model = TinyCNN(n_feat=X_train.shape[1], n_classes=3).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
             class_weights = torch.tensor([1.0, 118.0, 118.0]).to(device)  # none, comp, reg
             criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-            # --- Training loop ---
+            
             loss_hist = []
             for epoch in range(args.epochs):
                 running = 0.0
@@ -242,7 +205,7 @@ def main(args):
                 loss_hist.append(epoch_loss)
             all_loss.append(loss_hist)
 
-            # --- Validation: probabilities ---
+            
             model.eval()
             with torch.no_grad():
                 logits_val = []
@@ -288,8 +251,8 @@ def main(args):
             ap_comp_list.append(ap_comp)
             ap_reg_list.append(ap_reg)
 
-            # --- Update best fold by mean(AP) with tie-breakers ---
-            score = 0.5 * (ap_comp + ap_reg)  # <-- selection criterion you chose (Option 1)
+            #
+            score = 0.5 * (ap_comp + ap_reg)  
             improves = False
             if score > best_score:
                 improves = True
@@ -320,7 +283,7 @@ def main(args):
                     "fold_index": int(fold + 1)
                 }
 
-            # --- Save per-fold loss plot ---
+            
             import matplotlib.pyplot as plt
             plt.figure()
             plt.plot(range(1, len(loss_hist)+1), loss_hist, marker='o')
@@ -329,7 +292,7 @@ def main(args):
             plt.savefig(f"loss_fold{fold+1}.png", dpi=200, bbox_inches="tight")
             print(f"Saved loss_fold{fold+1}.png")
 
-        # ------------------ SAVE BEST FOLD (AFTER LOOP) ------------------
+        
         if best_bundle is None:
             print("\n[WARN] No best fold was captured — nothing saved.")
         else:
@@ -359,317 +322,6 @@ def main(args):
         else:
             print("\n=== 5-fold averages ===")
             print("No folds ran: check your data and group assignments.")
-
-    # groups = df["day_id"] if "day_id" in df.columns else None
-    # if groups is not None:
-    #     ap_comp_list, ap_reg_list = [], []
-    #     all_loss = []  # For combined loss plot
-    #     gkf = GroupKFold(n_splits=5)
-    #     best_score = -1.0
-    #     best_meta = None   # will hold (fold_idx, ap_comp, ap_reg, best_comp, best_reg)
-    #     best_bundle = None # will hold the dict we’ll joblib.dump at the end
-
-    #     for fold, (tr, va) in enumerate(gkf.split(X, y, groups=groups)):
-    #         print(f"\n=== Fold {fold+1} ===")
-    #         X_train, X_val = X[tr], X[va]
-    #         y_train, y_val = y[tr], y[va]
-    #         ts_val = df["timestamp"].iloc[va]
-
-    #         # Scale
-    #         scaler = StandardScaler()
-    #         X_train = scaler.fit_transform(X_train)
-    #         X_val   = scaler.transform(X_val)
-
-    #         # --- CNN: reshape and convert to torch tensors ---
-    #         # CNN expects [B, n_feat, T], here T=1
-    #         X_train_torch = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)  # [N, n_feat, 1]
-    #         y_train_torch = torch.tensor(y_train, dtype=torch.long)
-    #         X_val_torch   = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1)
-    #         y_val_torch   = torch.tensor(y_val, dtype=torch.long)
-
-    #         train_ds = TensorDataset(X_train_torch, y_train_torch)
-    #         val_ds   = TensorDataset(X_val_torch, y_val_torch)
-    #         train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    #         val_loader   = DataLoader(val_ds, batch_size=256)
-
-    #         # --- Model ---
-    #         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #         model = TinyCNN(n_feat=X_train.shape[1], n_classes=3).to(device)
-    #         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    #         # Set class weights: prefer class 2 (regular/true low) > class 1 (compression) > class 0 (none)
-    #         weight_none = 1.0
-    #         weight_comp = 5.0    # compression
-    #         weight_reg  = 10.0   # regular/true low (highest penalty for missing)
-    #         class_weights = torch.tensor([weight_none, weight_comp, weight_reg]).to(device)
-    #         criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    #         # --- Training loop ---
-    #         loss_hist = []
-    #         for epoch in range(args.epochs):
-    #             running = 0.0
-    #             for xb, yb in train_loader:
-    #                 xb, yb = xb.to(device), yb.to(device)
-    #                 optimizer.zero_grad()
-    #                 loss = criterion(model(xb), yb)
-    #                 loss.backward()
-    #                 optimizer.step()
-    #                 running += loss.item() * xb.size(0)
-    #             epoch_loss = running / len(train_ds)
-    #             loss_hist.append(epoch_loss)
-    #         all_loss.append(loss_hist)
-
-    #         # --- Validation: get probabilities ---
-    #         model.eval()
-    #         with torch.no_grad():
-    #             logits_val = []
-    #             for xb, _ in val_loader:
-    #                 xb = xb.to(device)
-    #                 logits_val.append(model(xb).cpu())
-    #             logits_val = torch.cat(logits_val, dim=0)
-    #             P_val = torch.softmax(logits_val, dim=1).numpy()
-    #         p_comp = P_val[:,1]
-    #         p_reg  = P_val[:,2]
-
-    #         # AP scores (optional but nice on poster)
-    #         from sklearn.metrics import average_precision_score
-    #         ap_comp = average_precision_score((y_val==1).astype(int), p_comp)
-    #         ap_reg  = average_precision_score((y_val==2).astype(int), p_reg)
-    #         print(f"Average Precision - compression: {ap_comp:.3f}")
-    #         print(f"Average Precision - regular    : {ap_reg:.3f}")
-
-    #         # Thresholds
-    #         best_comp = pick_threshold((y_val==1).astype(int), p_comp, ts_val,
-    #                                    max_false_per_day=args.fa_day_comp)
-    #         best_reg  = pick_threshold((y_val==2).astype(int), p_reg , ts_val,
-    #                                    max_false_per_day=args.fa_day_reg)
-
-    #         print("Chosen thresholds:")
-    #         print(f"  Compression -> T={best_comp['T']:.3f}, Sens={best_comp['sens']:.3f}, FA/day={best_comp['fa_per_day']:.3f}")
-    #         print(f"  Regular     -> T={best_reg['T']:.3f}, Sens={best_reg['sens']:.3f}, FA/day={best_reg['fa_per_day']:.3f}")
-
-    #         # Confusion matrix at those thresholds
-    #         preds_val = np.zeros_like(y_val)
-    #         # prefer compression if both exceed
-    #         for i in range(len(y_val)):
-    #             if p_comp[i] > best_comp["T"]:
-    #                 preds_val[i] = 1
-    #             elif p_reg[i] > best_reg["T"]:
-    #                 preds_val[i] = 2
-    #             else:
-    #                 preds_val[i] = 0
-
-    #         cm = confusion_matrix(y_val, preds_val, labels=[0,1,2])
-    #         print("\nConfusion matrix [rows=true, cols=pred]:\n", cm)
-    #         print("\nClassification report (using thresholded preds):\n",
-    #               classification_report(y_val, preds_val, labels=[0,1,2], digits=3))
-    #         # Optionally: aggregate or save results per fold
-    #         ap_comp_list.append(ap_comp)
-    #         ap_reg_list.append(ap_reg)
-
-    #         # --- Plot loss curve for this fold ---
-    #         import matplotlib.pyplot as plt
-    #         plt.figure()
-    #         plt.plot(range(1, len(loss_hist)+1), loss_hist, marker='o')
-    #         plt.xlabel("Epoch")
-    #         plt.ylabel("Training loss")
-    #         plt.title(f"Fold {fold+1} – loss curve")
-    #         plt.grid(True)
-    #         plt.savefig(f"loss_fold{fold+1}.png", dpi=200, bbox_inches="tight")
-    #         print(f"Saved loss_fold{fold+1}.png")
-
-    #         # ---- Select best fold by mean(AP_comp, AP_reg) with tie-breakers ----
-    #         score = 0.5 * (ap_comp + ap_reg)
-
-    #         improves = False
-    #         if score > best_score:
-    #             improves = True
-    #         elif np.isclose(score, best_score, atol=1e-6):
-    #             # tie-breaker 1: prefer higher AP on REGULAR (true lows)
-    #             prev = best_meta
-    #             if prev is None or (ap_reg > prev[2] + 1e-6):
-    #                 improves = True
-    #             elif np.isclose(ap_reg, prev[2], atol=1e-6) and ap_comp > prev[1] + 1e-6:
-    #                 # tie-breaker 2: higher AP on compression
-    #                 improves = True
-
-    #         if improves:
-    #             best_score = score
-    #             best_meta  = (fold, ap_comp, ap_reg, best_comp, best_reg)
-
-    #             # Save the CURRENT fold’s model/scaler/thresholds as the candidate best
-    #             best_bundle = {
-    #                 "scaler": scaler,
-    #                 "model_state_dict": model.state_dict(),
-    #                 "T_comp": best_comp["T"],
-    #                 "T_reg":  best_reg["T"],
-    #                 "win_var": args.win_var,
-    #                 "delta_short": args.delta_short,
-    #                 "delta_pct": args.delta_pct,
-    #                 # Optional: keep some bookkeeping
-    #                 "selected_by": "mean_AP",
-    #                 "ap_comp": float(ap_comp),
-    #                 "ap_reg": float(ap_reg),
-    #                 "fold_index": int(fold + 1)
-    #             }
-    #     # ------------------ SAVE BEST FOLD ------------------
-    #     if best_bundle is None:
-    #         print("\n[WARN] No best fold was captured — nothing saved.")
-    #     else:
-    #         joblib.dump(best_bundle, args.out)
-    #         print(f"\n=== Selected best fold: {best_bundle['fold_index']} ===")
-    #         print(f"AP_comp={best_bundle['ap_comp']:.3f}  AP_reg={best_bundle['ap_reg']:.3f}")
-    #         print(f"Saved best fold model to: {args.out}")
-    #     # Combined loss plot for all folds
-    #     plt.figure()
-    #     for i, lh in enumerate(all_loss):
-    #         plt.plot(range(1, len(lh)+1), lh, label=f"Fold {i+1}")
-    #     plt.xlabel("Epoch")
-    #     plt.ylabel("Training loss")
-    #     plt.legend()
-    #     plt.title("Epoch vs Loss – all folds")
-    #     plt.grid(True)
-    #     plt.savefig("loss_all_folds.png", dpi=200, bbox_inches="tight")
-    #     print("Saved loss_all_folds.png")
-
-    #     # Only print averages if at least one fold ran
-    #     if ap_comp_list and ap_reg_list:
-    #         print("\n=== 5‑fold averages ===")
-    #         print(f"AP‑comp   : {np.mean(ap_comp_list):.3f} ± {np.std(ap_comp_list):.3f}")
-    #         print(f"AP‑regular: {np.mean(ap_reg_list):.3f} ± {np.std(ap_reg_list):.3f}")
-    #     else:
-    #         print("\n=== 5‑fold averages ===")
-    #         print("No folds ran: check your data and group assignments.")
-    # else:
-    #     # Train/val split
-    #     if "group_id" in df.columns:
-    #         groups = df["group_id"].astype(str).to_numpy()
-    #         gss = GroupShuffleSplit(test_size=0.2, n_splits=1, random_state=42)
-    #         tr, va = next(gss.split(X, y, groups))
-    #     else:
-    #         tr, va = train_test_split(np.arange(len(y)), test_size=0.2,
-    #                                   stratify=y, random_state=42)
-    #         groups = None
-
-    #     X_train, X_val = X[tr], X[va]
-    #     y_train, y_val = y[tr], y[va]
-    #     ts_val = df["timestamp"].iloc[va]
-
-    #     # Scale
-    #     scaler = StandardScaler()
-    #     X_train = scaler.fit_transform(X_train)
-    #     X_val   = scaler.transform(X_val)
-
-    #     # --- CNN: reshape and convert to torch tensors ---
-    #     # CNN expects [B, n_feat, T], here T=1
-    #     X_train_torch = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)  # [N, n_feat, 1]
-    #     y_train_torch = torch.tensor(y_train, dtype=torch.long)
-    #     X_val_torch   = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1)
-    #     y_val_torch   = torch.tensor(y_val, dtype=torch.long)
-
-    #     train_ds = TensorDataset(X_train_torch, y_train_torch)
-    #     val_ds   = TensorDataset(X_val_torch, y_val_torch)
-    #     train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    #     val_loader   = DataLoader(val_ds, batch_size=256)
-
-    #     # --- Model ---
-    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #     model = TinyCNN(n_feat=X_train.shape[1], n_classes=3).to(device)
-    #     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    #     # Set class weights: prefer class 2 (regular/true low) > class 1 (compression) > class 0 (none)
-    #     weight_none = 1.0
-    #     weight_comp = 5.0    # compression
-    #     weight_reg  = 10.0   # regular/true low (highest penalty for missing)
-    #     class_weights = torch.tensor([weight_none, weight_comp, weight_reg]).to(device)
-    #     criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    #     # --- Training loop ---
-    #     n_epochs = 20
-    #     model.train()
-    #     for epoch in range(n_epochs):
-    #         total_loss = 0
-    #         for xb, yb in train_loader:
-    #             xb, yb = xb.to(device), yb.to(device)
-    #             optimizer.zero_grad()
-    #             logits = model(xb)
-    #             loss = criterion(logits, yb)
-    #             loss.backward()
-    #             optimizer.step()
-    #             total_loss += loss.item() * xb.size(0)
-    #         # Optionally print loss
-    #         # print(f"Epoch {epoch+1}/{n_epochs}, Loss: {total_loss/len(train_ds):.4f}")
-
-    #     # --- Validation: get probabilities ---
-    #     model.eval()
-    #     with torch.no_grad():
-    #         logits_val = []
-    #         for xb, _ in val_loader:
-    #             xb = xb.to(device)
-    #             logits_val.append(model(xb).cpu())
-    #         logits_val = torch.cat(logits_val, dim=0)
-    #         P_val = torch.softmax(logits_val, dim=1).numpy()
-    #     p_comp = P_val[:,1]
-    #     p_reg  = P_val[:,2]
-
-    #     # AP scores (optional but nice on poster)
-    #     from sklearn.metrics import average_precision_score
-    #     ap_comp = average_precision_score((y_val==1).astype(int), p_comp)
-    #     ap_reg  = average_precision_score((y_val==2).astype(int), p_reg)
-    #     print(f"Average Precision - compression: {ap_comp:.3f}")
-    #     print(f"Average Precision - regular    : {ap_reg:.3f}")
-
-    #     # Thresholds
-    #     best_comp = pick_threshold((y_val==1).astype(int), p_comp, ts_val,
-    #                                max_false_per_day=args.fa_day_comp)
-    #     best_reg  = pick_threshold((y_val==2).astype(int), p_reg , ts_val,
-    #                                max_false_per_day=args.fa_day_reg)
-
-    #     print("Chosen thresholds:")
-    #     print(f"  Compression -> T={best_comp['T']:.3f}, Sens={best_comp['sens']:.3f}, FA/day={best_comp['fa_per_day']:.3f}")
-    #     print(f"  Regular     -> T={best_reg['T']:.3f}, Sens={best_reg['sens']:.3f}, FA/day={best_reg['fa_per_day']:.3f}")
-
-    #     # Confusion matrix at those thresholds
-    #     preds_val = np.zeros_like(y_val)
-    #     # prefer compression if both exceed
-    #     for i in range(len(y_val)):
-    #         if p_comp[i] > best_comp["T"]:
-    #             preds_val[i] = 1
-    #         elif p_reg[i] > best_reg["T"]:
-    #             preds_val[i] = 2
-    #         else:
-    #             preds_val[i] = 0
-
-    #     cm = confusion_matrix(y_val, preds_val, labels=[0,1,2])
-    #     print("\nConfusion matrix [rows=true, cols=pred]:\n", cm)
-    #     print("\nClassification report (using thresholded preds):\n",
-    #           classification_report(y_val, preds_val, labels=[0,1,2], digits=3))
-
-    #     # Save artifacts
-    #     bundle = {
-    #         "scaler": scaler,
-    #         "model_state_dict": model.state_dict(),
-    #         "T_comp": best_comp["T"],
-    #         "T_reg":  best_reg["T"],
-    #         "win_var": args.win_var,
-    #         "delta_short": args.delta_short,
-    #         "delta_pct": args.delta_pct
-    #     }
-    #     joblib.dump(bundle, args.out)
-    #     print(f"\nSaved model bundle to {args.out}")
-
-    #     # Optional: save PR curves for poster
-    #     if args.save_curves:
-    #         import matplotlib.pyplot as plt
-    #         for cls_name, y_bin, p_bin, fname in [
-    #                 ("compression", (y_val==1).astype(int), p_comp, "pr_comp.png"),
-    #                 ("regular",     (y_val==2).astype(int), p_reg,  "pr_reg.png")]:
-    #             prec, rec, thr = precision_recall_curve(y_bin, p_bin)
-    #             plt.figure()
-    #             plt.plot(rec, prec)
-    #             plt.xlabel("Recall")
-    #             plt.ylabel("Precision")
-    #             plt.title(f"PR Curve - {cls_name}")
-    #             plt.savefig(fname, dpi=200, bbox_inches="tight")
-    #             print(f"Saved {fname}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
