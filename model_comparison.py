@@ -26,54 +26,43 @@ import time
 from collections import defaultdict
 
 # Import original CNN and feature functions
-from compression_onset import make_features, pick_threshold, TinyCNN, StreamingDetector
+from AI_in_Health.compression_onset import make_features, pick_threshold, TinyCNN, StreamingDetector
 from baseline_models import get_all_baselines_wrapped
 
 
-# Removed PyTorch baseline training since we only have sklearn baselines now
 
-
-def train_cnn_model(X_train, y_train, X_val, y_val, epochs=30, device="cpu"):
-    """Train the original CNN model."""
+def load_pretrained_cnn_model(X_val, cnn_bundle_path="/Users/alexanderellis/Desktop/glucose_nn/model_bundle_cnn.joblib"):
+    """Load the pre-trained CNN model and get predictions."""
+    
+    # Load the model bundle
+    bundle = joblib.load(cnn_bundle_path)
+    
+    # Extract components
+    scaler = bundle["scaler"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Scale validation features
+    X_val_scaled = scaler.transform(X_val)
     
     # Reshape for CNN (add sequence dimension)
-    X_train_torch = torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1)
-    y_train_torch = torch.tensor(y_train, dtype=torch.long)
-    X_val_torch = torch.tensor(X_val, dtype=torch.float32).unsqueeze(-1)
-    y_val_torch = torch.tensor(y_val, dtype=torch.long)
-
-    train_ds = TensorDataset(X_train_torch, y_train_torch)
-    val_ds = TensorDataset(X_val_torch, y_val_torch)
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=256)
-
-    # Model
-    model = TinyCNN(n_feat=X_train.shape[1], n_classes=3).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    class_weights = torch.tensor([1.0, 5.0, 10.0]).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-    # Training
-    model.train()
-    for epoch in range(epochs):
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
-            optimizer.step()
-
-    # Validation predictions
+    X_val_torch = torch.tensor(X_val_scaled, dtype=torch.float32).unsqueeze(-1)
+    
+    # Create and load model
+    model = TinyCNN(n_feat=X_val.shape[1], n_classes=3).to(device)
+    model.load_state_dict(bundle["model_state_dict"])
     model.eval()
+    
+    # Get predictions
     with torch.no_grad():
+        val_loader = DataLoader(TensorDataset(X_val_torch), batch_size=256)
         logits_val = []
-        for xb, _ in val_loader:
+        for (xb,) in val_loader:
             xb = xb.to(device)
             logits_val.append(model(xb).cpu())
         logits_val = torch.cat(logits_val, dim=0)
         P_val = torch.softmax(logits_val, dim=1).numpy()
     
-    return P_val, model
+    return P_val, model, scaler
 
 
 def evaluate_all_models(X_train, y_train, X_val, y_val, ts_val, args):
@@ -85,15 +74,16 @@ def evaluate_all_models(X_train, y_train, X_val, y_val, ts_val, args):
     print(f"Training on {len(X_train)} samples, validating on {len(X_val)} samples")
     print(f"Using device: {device}")
     
-    # 1. Train CNN (original model)
-    print("\n=== Training CNN ===")
+    # 1. Load pre-trained CNN model (instead of training)
+    print("\n=== Loading Pre-trained CNN ===")
     start_time = time.time()
-    cnn_probs, cnn_model = train_cnn_model(X_train, y_train, X_val, y_val, args.epochs, device)
+    cnn_probs, cnn_model, cnn_scaler = load_pretrained_cnn_model(X_val)
     cnn_time = time.time() - start_time
     results['cnn'] = {
         'probs': cnn_probs,
         'training_time': cnn_time,
-        'model': cnn_model
+        'model': cnn_model,
+        'scaler': cnn_scaler
     }
     
     # 2. Train baseline models (logistic regression and rule-based)
@@ -203,89 +193,167 @@ def analyze_model_performance(results, y_val, ts_val, args):
     return pd.DataFrame(performance_summary), threshold_results
 
 
-def create_comparison_plots(results, y_val, save_dir):
-    """Create comparison plots for all models."""
+def create_comparison_table_and_confusion_matrices(results, y_val, threshold_results, save_dir):
+    """Create a comparison table and confusion matrix figures for all models."""
     
     save_dir = Path(save_dir)
     save_dir.mkdir(exist_ok=True)
     
-    # 1. Average Precision comparison
-    model_names = []
-    ap_comp_scores = []
-    ap_reg_scores = []
+    # Prepare data for comparison table
+    model_data = []
     
     for model_name, result in results.items():
         probs = result['probs']
+        
+        # Calculate metrics
         ap_comp = average_precision_score((y_val == 1).astype(int), probs[:, 1])
         ap_reg = average_precision_score((y_val == 2).astype(int), probs[:, 2])
         
-        model_names.append(model_name)
-        ap_comp_scores.append(ap_comp)
-        ap_reg_scores.append(ap_reg)
+        # Get thresholds
+        best_comp = threshold_results[model_name]['comp_threshold']
+        best_reg = threshold_results[model_name]['reg_threshold']
+        
+        # Calculate predictions using thresholds
+        preds_val = np.zeros_like(y_val)
+        for i in range(len(y_val)):
+            if probs[i, 1] > best_comp["T"]:
+                preds_val[i] = 1
+            elif probs[i, 2] > best_reg["T"]:
+                preds_val[i] = 2
+            else:
+                preds_val[i] = 0
+        
+        # Calculate confusion matrix and metrics
+        cm = confusion_matrix(y_val, preds_val, labels=[0, 1, 2])
+        accuracy = np.trace(cm) / np.sum(cm)
+        
+        # Per-class metrics with proper handling
+        report = classification_report(y_val, preds_val, labels=[0, 1, 2], output_dict=True)
+        
+        comp_precision = 0.0
+        comp_f1 = 0.0
+        reg_precision = 0.0
+        reg_f1 = 0.0
+        
+        if '1' in report and isinstance(report['1'], dict):
+            comp_precision = report['1'].get('precision', 0.0)
+            comp_f1 = report['1'].get('f1-score', 0.0)
+        
+        if '2' in report and isinstance(report['2'], dict):
+            reg_precision = report['2'].get('precision', 0.0)
+            reg_f1 = report['2'].get('f1-score', 0.0)
+        
+        model_data.append({
+            'Model': model_name.upper(),
+            'AP Compression': f"{ap_comp:.3f}",
+            'AP Regular': f"{ap_reg:.3f}",
+            'AP Average': f"{(ap_comp + ap_reg) / 2:.3f}",
+            'Overall Accuracy': f"{accuracy:.3f}",
+            'Compression Sensitivity': f"{best_comp['sens']:.3f}",
+            'Compression FA/day': f"{best_comp['fa_per_day']:.3f}",
+            'Regular Sensitivity': f"{best_reg['sens']:.3f}",
+            'Regular FA/day': f"{best_reg['fa_per_day']:.3f}",
+            'Comp Precision': f"{comp_precision:.3f}",
+            'Comp F1-Score': f"{comp_f1:.3f}",
+            'Reg Precision': f"{reg_precision:.3f}",
+            'Reg F1-Score': f"{reg_f1:.3f}",
+            'Training Time (s)': f"{result['training_time']:.2f}"
+        })
     
-    # Plot AP comparison
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    # Create comparison table figure
+    fig, ax = plt.subplots(figsize=(20, 8))
+    ax.axis('tight')
+    ax.axis('off')
     
-    # Compression AP
-    ax1.barh(model_names, ap_comp_scores)
-    ax1.set_xlabel('Average Precision')
-    ax1.set_title('Compression Detection - Average Precision')
-    ax1.grid(True, alpha=0.3)
+    # Convert to DataFrame for easier handling
+    table_df = pd.DataFrame(model_data)
     
-    # Regular AP  
-    ax2.barh(model_names, ap_reg_scores)
-    ax2.set_xlabel('Average Precision')
-    ax2.set_title('Regular Low Detection - Average Precision')
-    ax2.grid(True, alpha=0.3)
+    # Create table
+    table = ax.table(cellText=table_df.values.tolist(),
+                     colLabels=table_df.columns.tolist(),
+                     cellLoc='center',
+                     loc='center')
     
-    plt.tight_layout()
-    plt.savefig(save_dir / 'ap_comparison.png', dpi=300, bbox_inches='tight')
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 2)
+    
+    # Color header row
+    for i in range(len(table_df.columns)):
+        table[(0, i)].set_facecolor('#4CAF50')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Alternate row colors
+    for i in range(1, len(table_df) + 1):
+        for j in range(len(table_df.columns)):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#f0f0f0')
+    
+    plt.title('Model Comparison Table: CNN vs Baseline Models', 
+              fontsize=16, fontweight='bold', pad=20)
+    plt.savefig(save_dir / 'model_comparison_table.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    # 2. PR Curves for top models
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    # Create confusion matrices for each model
+    n_models = len(results)
+    fig, axes = plt.subplots(1, n_models, figsize=(6 * n_models, 5))
     
-    # Select all available models (should be 3: CNN, logistic regression, rule-based)
-    avg_ap = [(name, (ap_comp_scores[i] + ap_reg_scores[i]) / 2) 
-              for i, name in enumerate(model_names)]
-    top_models = sorted(avg_ap, key=lambda x: x[1], reverse=True)
+    if n_models == 1:
+        axes = [axes]
     
-    colors = plt.cm.Set1(np.linspace(0, 1, len(top_models)))
-    
-    for (model_name, _), color in zip(top_models, colors):
-        probs = results[model_name]['probs']
+    for idx, (model_name, result) in enumerate(results.items()):
+        probs = result['probs']
         
-        # Compression PR curve
-        prec_comp, rec_comp, _ = precision_recall_curve(
-            (y_val == 1).astype(int), probs[:, 1]
-        )
-        ap_comp = average_precision_score((y_val == 1).astype(int), probs[:, 1])
-        ax1.plot(rec_comp, prec_comp, label=f'{model_name} (AP={ap_comp:.3f})', color=color)
+        # Get thresholds
+        best_comp = threshold_results[model_name]['comp_threshold']
+        best_reg = threshold_results[model_name]['reg_threshold']
         
-        # Regular PR curve
-        prec_reg, rec_reg, _ = precision_recall_curve(
-            (y_val == 2).astype(int), probs[:, 2]
-        )
-        ap_reg = average_precision_score((y_val == 2).astype(int), probs[:, 2])
-        ax2.plot(rec_reg, prec_reg, label=f'{model_name} (AP={ap_reg:.3f})', color=color)
-    
-    ax1.set_xlabel('Recall')
-    ax1.set_ylabel('Precision')
-    ax1.set_title('Compression Detection - PR Curves (All Models)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.set_xlabel('Recall')
-    ax2.set_ylabel('Precision')
-    ax2.set_title('Regular Low Detection - PR Curves (All Models)')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+        # Calculate predictions using thresholds
+        preds_val = np.zeros_like(y_val)
+        for i in range(len(y_val)):
+            if probs[i, 1] > best_comp["T"]:
+                preds_val[i] = 1
+            elif probs[i, 2] > best_reg["T"]:
+                preds_val[i] = 2
+            else:
+                preds_val[i] = 0
+        
+        # Calculate confusion matrix
+        cm = confusion_matrix(y_val, preds_val, labels=[0, 1, 2])
+        
+        # Plot confusion matrix
+        ax = axes[idx]
+        im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+        ax.figure.colorbar(im, ax=ax)
+        
+        # Add text annotations
+        thresh = cm.max() / 2.
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, format(cm[i, j], 'd'),
+                       ha="center", va="center",
+                       color="white" if cm[i, j] > thresh else "black",
+                       fontsize=12, fontweight='bold')
+        
+        ax.set_xlabel('Predicted Label', fontsize=12)
+        ax.set_ylabel('True Label', fontsize=12)
+        ax.set_title(f'{model_name.upper()}\nConfusion Matrix', fontsize=14, fontweight='bold')
+        ax.set_xticks([0, 1, 2])
+        ax.set_yticks([0, 1, 2])
+        ax.set_xticklabels(['None', 'Compression', 'Regular'])
+        ax.set_yticklabels(['None', 'Compression', 'Regular'])
+        
+        # Add accuracy text
+        accuracy = np.trace(cm) / np.sum(cm)
+        ax.text(0.5, -0.15, f'Accuracy: {accuracy:.3f}', 
+                transform=ax.transAxes, ha='center', fontsize=11, fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig(save_dir / 'pr_curves_all_models.png', dpi=300, bbox_inches='tight')
+    plt.savefig(save_dir / 'confusion_matrices.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"Plots saved to {save_dir}")
+    print(f"Comparison table and confusion matrices saved to {save_dir}")
 
 
 def main(args):
@@ -352,7 +420,7 @@ def main(args):
     performance_df.to_csv(output_dir / 'model_comparison.csv', index=False)
     
     # Create comparison plots
-    create_comparison_plots(results, y_val, output_dir)
+    create_comparison_table_and_confusion_matrices(results, y_val, threshold_results, output_dir)
     
     # Print summary
     print("\n" + "="*80)
