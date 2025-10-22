@@ -1,7 +1,6 @@
 #!/bin/bash
 git clone https://github.com/forpetesaken/Individual_project.git
-cd Individual_project || exit
-source virtual_env/bin/activate
+cd Individual_project || exit 1
 
 ## Exploratory Data Analysis
 /usr/local/bin/python "./AI_in_Health/eda.py" --csv "./AI_in_Health/training.validation_data.csv"
