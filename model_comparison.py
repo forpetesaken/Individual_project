@@ -303,7 +303,7 @@ def create_comparison_table_and_confusion_matrices(results, y_val, threshold_res
             if i % 2 == 0:
                 table[(i, j)].set_facecolor('#f0f0f0')
     
-    plt.title('Model Comparison Table: CNN vs Baseline Models', 
+    plt.title('Model Comparison Table: CNN vs Baseline Model', 
               fontsize=16, fontweight='bold', pad=20)
     plt.savefig(save_dir / 'model_comparison_table.png', dpi=300, bbox_inches='tight')
     plt.close()
