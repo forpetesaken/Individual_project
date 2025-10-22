@@ -223,7 +223,7 @@ def main(args):
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model = TinyCNN(n_feat=X_train.shape[1], n_classes=3).to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-            class_weights = torch.tensor([1.0, 5.0, 10.0]).to(device)  # none, comp, reg
+            class_weights = torch.tensor([1.0, 118.0, 118.0]).to(device)  # none, comp, reg
             criterion = nn.CrossEntropyLoss(weight=class_weights)
 
             # --- Training loop ---
@@ -347,7 +347,7 @@ def main(args):
         for i, lh in enumerate(all_loss):
             plt.plot(range(1, len(lh)+1), lh, label=f"Fold {i+1}")
         plt.xlabel("Epoch"); plt.ylabel("Training loss")
-        plt.legend(); plt.title("Epoch vs Loss – all folds"); plt.grid(True)
+        plt.legend(); plt.title("Epoch vs Loss - all folds"); plt.grid(True)
         plt.savefig("loss_all_folds.png", dpi=200, bbox_inches="tight")
         print("Saved loss_all_folds.png")
 

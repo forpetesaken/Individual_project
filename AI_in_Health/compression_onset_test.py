@@ -7,6 +7,8 @@
 
 import argparse, joblib, numpy as np, pandas as pd
 from sklearn.metrics import confusion_matrix, classification_report, average_precision_score, precision_recall_curve
+import os
+from pathlib import Path
 
 try:
     import torch, torch.nn as nn
@@ -51,6 +53,14 @@ def load_bundle(path):
                     "or sklearn keys ('model'|'clf').")
 
 def main(args):
+    # Create output directory if specified
+    if args.out:
+        output_dir = Path(args.out)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Output directory: {output_dir.absolute()}")
+    else:
+        output_dir = Path(".")
+    
     # --- Load TEST CSV
     df = pd.read_csv(args.test_csv)
     df["glucose"] = df["glucose"].astype(str).str.upper().replace({"HIGH":401,"LOW":39}).astype(float)
@@ -147,8 +157,42 @@ def main(args):
     print("\nClassification report (thresholded preds):\n",
           classification_report(y_true, preds, labels=[0,1,2], digits=3))
 
+    # Save confusion matrix as figure
+    if args.save_crosstab or args.out:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(8, 6))
+        im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+        ax.figure.colorbar(im, ax=ax)
+        
+        # Add text annotations
+        thresh = cm.max() / 2.
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, format(cm[i, j], 'd'),
+                       ha="center", va="center",
+                       color="white" if cm[i, j] > thresh else "black",
+                       fontsize=12, fontweight='bold')
+        
+        ax.set_xlabel('Predicted Label', fontsize=12)
+        ax.set_ylabel('True Label', fontsize=12)
+        ax.set_title('Confusion Matrix (Crosstab)', fontsize=14, fontweight='bold')
+        ax.set_xticks([0, 1, 2])
+        ax.set_yticks([0, 1, 2])
+        ax.set_xticklabels(['None', 'Compression', 'Regular'])
+        ax.set_yticklabels(['None', 'Compression', 'Regular'])
+        
+        # Add accuracy text
+        accuracy = np.trace(cm) / np.sum(cm)
+        ax.text(0.5, -0.15, f'Accuracy: {accuracy:.3f}', 
+                transform=ax.transAxes, ha='center', fontsize=11, fontweight='bold')
+        
+        crosstab_path = output_dir / "confusion_matrix.png"
+        plt.savefig(crosstab_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Saved confusion matrix to {crosstab_path}")
+
     # Optional outputs
-    if args.save_curves:
+    if args.save_curves or args.out:
         import matplotlib.pyplot as plt
         for cls_name, y_bin, p_bin, fname in [
             ("compression", (y_true==1).astype(int), p_comp, "pr_comp.png"),
@@ -159,23 +203,28 @@ def main(args):
             plt.figure()
             plt.plot(rec, prec)
             plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title(f"PR Curve - {cls_name}")
-            plt.savefig(fname, dpi=200, bbox_inches="tight")
-            print(f"Saved {fname}")
+            curve_path = output_dir / fname
+            plt.savefig(curve_path, dpi=200, bbox_inches="tight")
+            plt.close()
+            print(f"Saved {curve_path}")
 
     if args.save_probs:
+        probs_path = output_dir / args.save_probs if args.out else args.save_probs
         pd.DataFrame({
             "timestamp": ts, "y_true": y_true,
             "p_none": p_none, "p_comp": p_comp, "p_reg": p_reg,
             "pred": preds
-        }).to_csv(args.save_probs, index=False)
-        print(f"Saved probabilities to {args.save_probs}")
+        }).to_csv(probs_path, index=False)
+        print(f"Saved probabilities to {probs_path}")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--bundle", required=True, help="Path to the BEST bundle saved by training")
     ap.add_argument("--test_csv", required=True, help="Path to TEST CSV")
-    ap.add_argument("--save_curves", action="store_true")
-    ap.add_argument("--save_probs", default="")
+    ap.add_argument("--out", default="", help="Output directory for saved figures and files")
+    ap.add_argument("--save_curves", action="store_true", help="Save PR curves")
+    ap.add_argument("--save_crosstab", action="store_true", help="Save confusion matrix figure")
+    ap.add_argument("--save_probs", default="", help="Filename to save probabilities CSV")
     # Optional overrides (use only if your bundle didn't store the exact values)
     ap.add_argument("--win_var", type=int, default=None)
     ap.add_argument("--delta_short", type=int, default=None)

@@ -4,7 +4,6 @@ Model Comparison Script
 
 Compare CNN model against simple baseline approaches:
 - Logistic Regression (statistical baseline)
-- Rule-based model (clinical baseline)
 
 Simplified version to avoid dependency issues.
 """
@@ -26,23 +25,34 @@ import time
 from collections import defaultdict
 
 # Import original CNN and feature functions
-from AI_in_Health.compression_onset import make_features, pick_threshold, TinyCNN, StreamingDetector
+from AI_in_Health.compression_onset import make_features, pick_threshold, TinyCNN
 from baseline_models import get_all_baselines_wrapped
 
 
 
-def load_pretrained_cnn_model(X_val, cnn_bundle_path="/Users/alexanderellis/Desktop/glucose_nn/model_bundle_cnn.joblib"):
-    """Load the pre-trained CNN model and get predictions."""
+def load_pretrained_cnn_model(df_val, y_val, cnn_bundle_path):
+    """Load the pre-trained CNN model and get predictions using the same approach as compression_onset_test."""
     
     # Load the model bundle
     bundle = joblib.load(cnn_bundle_path)
     
-    # Extract components
-    scaler = bundle["scaler"]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Get feature parameters from bundle (same as compression_onset_test)
+    win_var = bundle.get("win_var", 15)
+    d_short = bundle.get("delta_short", 5) 
+    d_pct = bundle.get("delta_pct", 10)
     
-    # Scale validation features
+    print(f"Using CNN bundle feature params: win_var={win_var}, d_short={d_short}, d_pct={d_pct}")
+    
+    # Build features using the SAME parameters as the trained model
+    glucose_val = df_val["glucose"].to_numpy(dtype=float)
+    X_val = make_features(glucose_val, win_var, d_short, d_pct)
+    
+    # Use the CNN's own scaler from the bundle
+    scaler = bundle["scaler"]
     X_val_scaled = scaler.transform(X_val)
+    
+    # Setup device and model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # Reshape for CNN (add sequence dimension)
     X_val_torch = torch.tensor(X_val_scaled, dtype=torch.float32).unsqueeze(-1)
@@ -52,32 +62,25 @@ def load_pretrained_cnn_model(X_val, cnn_bundle_path="/Users/alexanderellis/Desk
     model.load_state_dict(bundle["model_state_dict"])
     model.eval()
     
-    # Get predictions
+    # Get predictions (same as compression_onset_test)
     with torch.no_grad():
-        val_loader = DataLoader(TensorDataset(X_val_torch), batch_size=256)
-        logits_val = []
-        for (xb,) in val_loader:
-            xb = xb.to(device)
-            logits_val.append(model(xb).cpu())
-        logits_val = torch.cat(logits_val, dim=0)
-        P_val = torch.softmax(logits_val, dim=1).numpy()
+        logits = model(X_val_torch.to(device)).cpu()
+        P_val = torch.softmax(logits, dim=1).numpy()
     
     return P_val, model, scaler
 
 
-def evaluate_all_models(X_train, y_train, X_val, y_val, ts_val, args):
+def evaluate_all_models(df_train, df_val, y_train, y_val, ts_val, args):
     """Evaluate CNN and baseline models on the same train/validation split."""
     
     results = {}
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    print(f"Training on {len(X_train)} samples, validating on {len(X_val)} samples")
-    print(f"Using device: {device}")
+    print(f"Training on {len(df_train)} samples, validating on {len(df_val)} samples")
     
-    # 1. Load pre-trained CNN model (instead of training)
+    # 1. Load pre-trained CNN model (uses its own feature extraction)
     print("\n=== Loading Pre-trained CNN ===")
     start_time = time.time()
-    cnn_probs, cnn_model, cnn_scaler = load_pretrained_cnn_model(X_val)
+    cnn_probs, cnn_model, cnn_scaler = load_pretrained_cnn_model(df_val, y_val, args.cnn_bundle)
     cnn_time = time.time() - start_time
     results['cnn'] = {
         'probs': cnn_probs,
@@ -86,15 +89,33 @@ def evaluate_all_models(X_train, y_train, X_val, y_val, ts_val, args):
         'scaler': cnn_scaler
     }
     
-    # 2. Train baseline models (logistic regression and rule-based)
+    # 2. For baseline models, we need to build features using comparison script parameters
+    glucose_train = df_train["glucose"].to_numpy(dtype=float)
+    glucose_val = df_val["glucose"].to_numpy(dtype=float)
+    
+    X_train = make_features(glucose_train,
+                           win_var=args.win_var,
+                           d_short=args.delta_short,
+                           d_pct=args.delta_pct)
+    X_val = make_features(glucose_val,
+                         win_var=args.win_var,
+                         d_short=args.delta_short,
+                         d_pct=args.delta_pct)
+    
+    # Scale features for baseline models
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    
+    # Train baseline models (logistic regression)
     baseline_models = get_all_baselines_wrapped()
     
     for name, model in baseline_models.items():
         print(f"\n=== Training {name} ===")
         start_time = time.time()
         try:
-            model.fit(X_train, y_train)
-            probs = model.predict_proba(X_val)
+            model.fit(X_train_scaled, y_train)
+            probs = model.predict_proba(X_val_scaled)
             training_time = time.time() - start_time
             
             results[name] = {
@@ -245,19 +266,11 @@ def create_comparison_table_and_confusion_matrices(results, y_val, threshold_res
         
         model_data.append({
             'Model': model_name.upper(),
-            'AP Compression': f"{ap_comp:.3f}",
-            'AP Regular': f"{ap_reg:.3f}",
-            'AP Average': f"{(ap_comp + ap_reg) / 2:.3f}",
-            'Overall Accuracy': f"{accuracy:.3f}",
-            'Compression Sensitivity': f"{best_comp['sens']:.3f}",
-            'Compression FA/day': f"{best_comp['fa_per_day']:.3f}",
-            'Regular Sensitivity': f"{best_reg['sens']:.3f}",
-            'Regular FA/day': f"{best_reg['fa_per_day']:.3f}",
-            'Comp Precision': f"{comp_precision:.3f}",
-            'Comp F1-Score': f"{comp_f1:.3f}",
-            'Reg Precision': f"{reg_precision:.3f}",
-            'Reg F1-Score': f"{reg_f1:.3f}",
-            'Training Time (s)': f"{result['training_time']:.2f}"
+            'Accuracy': f"{accuracy:.3f}",
+            'Compression Precision': f"{comp_precision:.3f}",
+            'Compression F1-Score': f"{comp_f1:.3f}",
+            'Regular Precision': f"{reg_precision:.3f}",
+            'Regular F1-Score': f"{reg_f1:.3f}"
         })
     
     # Create comparison table figure
@@ -376,13 +389,7 @@ def main(args):
     glucose = df["glucose"].to_numpy(dtype=float)
     y = df["label"].astype(int).to_numpy()
 
-    # Build features
-    X = make_features(glucose,
-                      win_var=args.win_var,
-                      d_short=args.delta_short,
-                      d_pct=args.delta_pct)
-
-    print(f"Dataset: {len(X)} samples, {X.shape[1]} features")
+    print(f"Dataset: {len(df)} samples")
     print(f"Class distribution: {np.bincount(y)}")
     
     # Create output directory
@@ -393,25 +400,20 @@ def main(args):
     if "day_id" in df.columns:
         groups = df["day_id"].astype(str).to_numpy()
         gss = GroupShuffleSplit(test_size=0.2, n_splits=1, random_state=42)
-        tr, va = next(gss.split(X, y, groups))
+        tr, va = next(gss.split(df, y, groups))
     else:
         tr, va = train_test_split(np.arange(len(y)), test_size=0.2,
                                   stratify=y, random_state=42)
 
-    X_train, X_val = X[tr], X[va]
+    df_train, df_val = df.iloc[tr].copy(), df.iloc[va].copy()
     y_train, y_val = y[tr], y[va]
     ts_val = df["timestamp"].iloc[va]
-
-    # Scale features for models that need it
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
     
-    print(f"Train set: {len(X_train)} samples")
-    print(f"Validation set: {len(X_val)} samples")
+    print(f"Train set: {len(df_train)} samples")
+    print(f"Validation set: {len(df_val)} samples")
 
     # Train and evaluate all models
-    results = evaluate_all_models(X_train_scaled, y_train, X_val_scaled, y_val, ts_val, args)
+    results = evaluate_all_models(df_train, df_val, y_train, y_val, ts_val, args)
     
     # Analyze performance
     performance_df, threshold_results = analyze_model_performance(results, y_val, ts_val, args)
@@ -444,8 +446,12 @@ def main(args):
     best_model = results[best_model_name]['model']
     
     # Save model bundle (similar to original script)
+    # Use the scaler from the best baseline model if available
+    best_model_result = results[best_model_name]
+    baseline_scaler = StandardScaler()  # Create a new scaler as fallback
+    
     bundle = {
-        "scaler": scaler,
+        "baseline_scaler": baseline_scaler,
         "best_model_name": best_model_name,
         "all_results": results,
         "performance_summary": performance_df,
@@ -462,15 +468,15 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compare CNN with simple baseline models (logistic regression + rule-based)")
+    parser = argparse.ArgumentParser(description="Compare CNN with logistic regression baseline model")
     parser.add_argument("--csv", required=True, help="Path to labeled CSV")
+    parser.add_argument("--cnn_bundle", required=True, help="Path to pre-trained CNN model bundle")
     parser.add_argument("--output_dir", default="comparison_results", help="Output directory")
     parser.add_argument("--fa_day_comp", type=float, default=0.5, help="Max false alerts/day for compression")
     parser.add_argument("--fa_day_reg", type=float, default=1.0, help="Max false alerts/day for regular")
     parser.add_argument("--win_var", type=int, default=15, help="Window (samples) for rolling variance")
     parser.add_argument("--delta_short", type=int, default=5, help="Samples for short delta (d5)")
     parser.add_argument("--delta_pct", type=int, default=10, help="Samples for %drop window")
-    parser.add_argument("--epochs", type=int, default=30, help="Training epochs for CNN")
     
     args = parser.parse_args()
     main(args)

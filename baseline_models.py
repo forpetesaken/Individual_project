@@ -112,7 +112,6 @@ def get_all_baselines():
     """Get dictionary of minimal baseline models."""
     return {
         'logistic_regression': LogisticRegressionBaseline(),
-        'rule_based': RuleBasedBaseline(),
     }
 
 
